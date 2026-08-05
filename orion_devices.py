@@ -353,6 +353,11 @@ def build_client(args):
             username=args.username,
             secret_path=args.secret_path,
             vault_password_file=args.vault_password_file,
+            # getattr rather than direct access: orion_inventory_sync.py
+            # shares this function, and a caller that has not defined
+            # these should get the defaults rather than an AttributeError.
+            username_key=getattr(args, "username_key", "username"),
+            password_key=getattr(args, "password_key", "password"),
             port=args.port,
             verify_ssl=not args.insecure,
             timeout=args.timeout,
@@ -398,7 +403,17 @@ def main():
                            "orion_secret.yml. Needs ansible-core, so this is "
                            "the path for this side of the airgap, not the "
                            "Orion side.")
-    conn.add_argument("--secret-path", default="orion_secret.yml")
+    conn.add_argument("--secret-path", default="orion_secret.yml",
+                      help="Vault-encrypted YAML holding the credentials "
+                           "(default: orion_secret.yml). Can be an existing "
+                           "vars file -- see --username-key/--password-key.")
+    conn.add_argument("--username-key", default="username",
+                      help="Which variable in the vault file holds the "
+                           "username (default: username). Dotted paths work "
+                           "for nested values, e.g. orion.api.username.")
+    conn.add_argument("--password-key", default="password",
+                      help="Which variable in the vault file holds the "
+                           "password (default: password). Dotted paths work.")
     conn.add_argument("--vault-password-file", default=None)
     conn.add_argument("--port", type=int, default=DEFAULT_SWIS_PORT,
                       help=f"SWIS SSL port (default: {DEFAULT_SWIS_PORT}). "

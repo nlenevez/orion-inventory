@@ -45,6 +45,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from orion_client import OrionClient, OrionError, format_status  # noqa: E402
 import orion_devices  # noqa: E402
 
+# Defined here rather than beside the tests that use it: the vault and
+# inventory suites both gate on it, and the first of them appears well
+# above where this used to live.
+try:
+    import ansible  # noqa: F401
+    HAVE_ANSIBLE = True
+except ImportError:  # pragma: no cover - depends on the host
+    HAVE_ANSIBLE = False
+
 
 USERNAME = "ansible"
 PASSWORD = "correct-horse"
@@ -661,6 +670,224 @@ class ParamParsingTests(unittest.TestCase):
             orion_devices.parse_params(["u=int:abc"])
 
 
+@unittest.skipUnless(HAVE_ANSIBLE, "ansible-core not installed")
+class VaultSecretTests(unittest.TestCase):
+    """--use-vault-secret against a REAL ansible-vault-encrypted file.
+
+    Encrypts with the actual `ansible-vault` binary rather than a
+    fixture: the point is that the file this reads is the file
+    ansible-vault produces, and a hand-written stand-in would only prove
+    the reader agrees with itself. This path shipped untested and is a
+    credential path, which is the worst combination to leave uncovered.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server = MockSwisServer()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.stop()
+
+    def setUp(self):
+        # ansible-core's vault secrets context is PROCESS-GLOBAL and
+        # first-write-wins, with no public reset. Another test class
+        # initialises it with a different password, which leaves inline
+        # `!vault` scalars here undecryptable -- these tests passed in
+        # isolation and failed in the suite until this was added.
+        # Reaching for the private attribute is the only way to give each
+        # test a clean context; the alternative is a test that only works
+        # when run alone, which is worse.
+        try:
+            from ansible.parsing.vault import VaultSecretsContext
+            VaultSecretsContext._current = None
+        except ImportError:  # pragma: no cover - older ansible-core
+            pass
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+
+        self.vault_pass = root / "vault_pass"
+        self.vault_pass.write_text("the-vault-password\n", encoding="utf-8")
+
+        self.secret = root / "orion_secret.yml"
+        self.secret.write_text(f"username: {USERNAME}\npassword: {PASSWORD}\n",
+                               encoding="utf-8")
+        result = subprocess.run(
+            ["ansible-vault", "encrypt", str(self.secret),
+             "--vault-password-file", str(self.vault_pass)],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.secret.read_text().startswith("$ANSIBLE_VAULT"),
+                        "fixture is not actually encrypted")
+
+    def run_cli(self, *extra):
+        import io
+        import contextlib
+        argv = ["orion_devices.py", "--host", "127.0.0.1",
+                "--port", str(self.server.port), "--insecure", *extra]
+        out, err = io.StringIO(), io.StringIO()
+        old = sys.argv
+        sys.argv = argv
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                try:
+                    code = orion_devices.main()
+                except SystemExit as e:
+                    code = e.code
+        finally:
+            sys.argv = old
+        return code, out.getvalue(), err.getvalue()
+
+    def test_credentials_come_from_the_vault(self):
+        """No --username and no --password-env: both must come out of
+        the encrypted file."""
+        code, out, err = self.run_cli(
+            "--use-vault-secret", "--secret-path", str(self.secret),
+            "--vault-password-file", str(self.vault_pass), "--format", "json")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(json.loads(out)), len(MOCK_NODES))
+
+    def test_vault_password_from_environment(self):
+        import os
+        os.environ["ANSIBLE_VAULT_PASSWORD_FILE"] = str(self.vault_pass)
+        self.addCleanup(os.environ.pop, "ANSIBLE_VAULT_PASSWORD_FILE", None)
+        code, out, err = self.run_cli(
+            "--use-vault-secret", "--secret-path", str(self.secret),
+            "--format", "json")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(json.loads(out)), len(MOCK_NODES))
+
+    def test_username_argument_overrides_the_file(self):
+        """The file carries a username, but an explicit one wins -- so a
+        single shared secret can serve more than one account."""
+        code, _, err = self.run_cli(
+            "--use-vault-secret", "--secret-path", str(self.secret),
+            "--vault-password-file", str(self.vault_pass),
+            "--username", "someone-else", "--format", "json")
+        # Wrong username against the mock's fixed credentials -> 401,
+        # which is proof the override reached the wire.
+        self.assertEqual(code, 1)
+        self.assertIn("401", err)
+
+    def test_wrong_vault_password_fails(self):
+        """Negative control: if this passed, the tests above would prove
+        nothing about decryption actually happening."""
+        bad = Path(self.tmp.name) / "bad_pass"
+        bad.write_text("wrong\n", encoding="utf-8")
+        code, _, err = self.run_cli(
+            "--use-vault-secret", "--secret-path", str(self.secret),
+            "--vault-password-file", str(bad), "--format", "json")
+        self.assertEqual(code, 1)
+        self.assertIn("decrypt", err.lower())
+
+    def _encrypt(self, path):
+        result = subprocess.run(
+            ["ansible-vault", "encrypt", str(path),
+             "--vault-password-file", str(self.vault_pass)],
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_existing_vars_file_with_custom_key_names(self):
+        """The realistic case: credentials already live in a vars file
+        alongside unrelated variables, under names of the estate's own
+        choosing. Requiring a purpose-made file would mean maintaining
+        the Orion credentials in two places."""
+        path = Path(self.tmp.name) / "group_vars_all.yml"
+        path.write_text(
+            f"---\nntp_servers:\n  - 10.0.0.1\n"
+            f"orion_api_user: {USERNAME}\n"
+            f"orion_api_password: {PASSWORD}\n"
+            f"snmp_community: public\n", encoding="utf-8")
+        self._encrypt(path)
+
+        code, out, err = self.run_cli(
+            "--use-vault-secret", "--secret-path", str(path),
+            "--vault-password-file", str(self.vault_pass),
+            "--username-key", "orion_api_user",
+            "--password-key", "orion_api_password", "--format", "json")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(json.loads(out)), len(MOCK_NODES))
+
+    def test_nested_values_via_dotted_path(self):
+        path = Path(self.tmp.name) / "nested.yml"
+        path.write_text(
+            f"---\norion:\n  api:\n    username: {USERNAME}\n"
+            f"    password: {PASSWORD}\n", encoding="utf-8")
+        self._encrypt(path)
+
+        code, out, err = self.run_cli(
+            "--use-vault-secret", "--secret-path", str(path),
+            "--vault-password-file", str(self.vault_pass),
+            "--username-key", "orion.api.username",
+            "--password-key", "orion.api.password", "--format", "json")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(json.loads(out)), len(MOCK_NODES))
+
+    def test_inline_encrypt_string_scalar(self):
+        """A PLAINTEXT vars file with only the password encrypted, which
+        is what `ansible-vault encrypt_string` produces and the most
+        common shape for an existing file.
+
+        This one genuinely broke: ansible-core returns a lazy object for
+        such scalars that decrypts on access via a process-global secrets
+        context, which ansible-playbook establishes during CLI bootstrap
+        and an API caller does not. str() on it raised "A required
+        VaultSecretsContext context is not active" -- at the point of
+        use, far from the load that looked responsible.
+        """
+        encrypted = subprocess.run(
+            ["ansible-vault", "encrypt_string", PASSWORD,
+             "--name", "orion_api_password",
+             "--vault-password-file", str(self.vault_pass)],
+            capture_output=True, text=True, check=True).stdout
+
+        path = Path(self.tmp.name) / "inline.yml"
+        path.write_text(f"---\norion_api_user: {USERNAME}\n{encrypted}\n",
+                        encoding="utf-8")
+        # The file itself must stay readable -- that is the entire point
+        # of encrypt_string over encrypting the whole file.
+        self.assertFalse(path.read_text().startswith("$ANSIBLE_VAULT"))
+        self.assertIn("!vault", path.read_text())
+
+        code, out, err = self.run_cli(
+            "--use-vault-secret", "--secret-path", str(path),
+            "--vault-password-file", str(self.vault_pass),
+            "--username-key", "orion_api_user",
+            "--password-key", "orion_api_password", "--format", "json")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(json.loads(out)), len(MOCK_NODES))
+
+    def test_wrong_key_name_names_the_key_and_lists_what_is_there(self):
+        """Negative control for the key-name feature, and the error that
+        makes it usable: "not found" alone would leave the reader
+        guessing at the spelling of their own variable."""
+        path = Path(self.tmp.name) / "vars.yml"
+        path.write_text(f"---\norion_api_user: {USERNAME}\n"
+                        f"orion_api_password: {PASSWORD}\n", encoding="utf-8")
+        self._encrypt(path)
+
+        code, _, err = self.run_cli(
+            "--use-vault-secret", "--secret-path", str(path),
+            "--vault-password-file", str(self.vault_pass),
+            "--username-key", "orion_api_user",
+            "--password-key", "no_such_var", "--format", "json")
+        self.assertEqual(code, 1)
+        self.assertIn("no_such_var", err)
+        self.assertIn("orion_api_password", err, "should list what IS there")
+
+    def test_missing_secret_file_explains_how_to_create_one(self):
+        code, _, err = self.run_cli(
+            "--use-vault-secret",
+            "--secret-path", str(Path(self.tmp.name) / "nope.yml"),
+            "--vault-password-file", str(self.vault_pass), "--format", "json")
+        self.assertEqual(code, 1)
+        self.assertIn("not found", err)
+        self.assertIn("ansible-vault encrypt", err)
+
+
 class CliEndToEndTests(unittest.TestCase):
     """Drives main() the way an operator does -- argv in, text out."""
 
@@ -756,12 +983,6 @@ class CliEndToEndTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("ORION_TEST_PASSWORD", err)
 
-
-try:
-    import ansible  # noqa: F401
-    HAVE_ANSIBLE = True
-except ImportError:  # pragma: no cover - depends on the host
-    HAVE_ANSIBLE = False
 
 import orion_inventory_sync as sync  # noqa: E402
 

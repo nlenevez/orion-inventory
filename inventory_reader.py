@@ -161,7 +161,41 @@ def configure_vault_secrets(loader, vault_password_file=None):
 
     secret = get_file_vault_secret(filename=pwd_file, loader=loader)
     secret.load()
-    loader.set_vault_secrets([("default", secret)])
+    secrets = [("default", secret)]
+    loader.set_vault_secrets(secrets)
+
+    # Whole-file encryption is decrypted by the loader, and the above is
+    # enough for it. Inline `!vault` scalars -- what `ansible-vault
+    # encrypt_string` produces, and the common shape for an existing
+    # vars file where only the sensitive values are encrypted -- are
+    # different: ansible-core returns a lazy object that decrypts on
+    # access, using a PROCESS-GLOBAL secrets context that ansible-playbook
+    # sets up during its own CLI bootstrap. A script using the API
+    # directly does not get that, so str() on such a value raises
+    # "A required VaultSecretsContext context is not active" -- at the
+    # point of use, far from the load that looks responsible.
+    #
+    # Confirmed on ansible-core 2.20.1. Guarded because the class does
+    # not exist on older versions, where these scalars decrypt eagerly
+    # via the loader and none of this is needed.
+    try:
+        from ansible.parsing.vault import VaultSecretsContext
+    except ImportError:  # pragma: no cover - older ansible-core
+        return
+
+    # initialize() raises if called twice, and the context is global for
+    # the process, so an existing one is left alone.
+    #
+    # That makes it FIRST-WRITE-WINS: if one process configures vault
+    # secrets twice with different password files, inline `!vault`
+    # scalars decrypt with whichever came first, while whole-file
+    # decryption still honours each loader's own secrets. Not a problem
+    # for these CLIs -- one invocation uses one vault password -- but it
+    # is why passing a different --vault-password-file for the inventory
+    # than for the credentials file would misbehave in one direction
+    # only, which would be baffling without this note.
+    if VaultSecretsContext.current(optional=True) is None:
+        VaultSecretsContext.initialize(VaultSecretsContext(secrets=secrets))
 
 
 def load_yaml_with_vault(path, vault_password_file=None):

@@ -313,10 +313,29 @@ class OrionClient:
     def base_url(self):
         return f"https://{self.host}:{self.port}{SWIS_BASE_PATH}"
 
+    @staticmethod
+    def _dig(data, dotted_key):
+        """Looks up a possibly-nested key, e.g. "orion.api.username".
+
+        Exists so an EXISTING vault file can be used as-is: real
+        group_vars rarely have bare `username`/`password` at the top
+        level, and requiring a purpose-made file would mean maintaining
+        the Orion credentials in a second place. Returns None if any
+        part of the path is missing, so the caller can report which key
+        it actually looked for.
+        """
+        node = data
+        for part in dotted_key.split("."):
+            if not isinstance(node, dict) or part not in node:
+                return None
+            node = node[part]
+        return node
+
     @classmethod
     def from_vault_secret(cls, host, secret_path="orion_secret.yml",
                           vault_password_file=None, port=DEFAULT_SWIS_PORT,
-                          verify_ssl=True, timeout=60, username=None):
+                          verify_ssl=True, timeout=60, username=None,
+                          username_key="username", password_key="password"):
         """Builds a client from an ansible-vault-encrypted YAML file --
         the recommended way to supply Orion credentials on this side of
         the airgap, and the same pattern phpipam_client.from_vault_secret()
@@ -369,19 +388,25 @@ class OrionClient:
                 f"ansible.cfg's vault_password_file)."
             )
 
-        if not secret_data or "password" not in secret_data:
+        resolved_password = cls._dig(secret_data or {}, password_key)
+        if resolved_password is None:
+            available = (", ".join(sorted(secret_data)) if isinstance(secret_data, dict)
+                         else "(file did not parse as a mapping)")
             raise OrionError(
-                f"{secret_file} decrypted but is missing 'password'. "
-                f"Expected:\n"
-                f"  username: ansible\n"
-                f"  password: <the Orion account password>"
+                f"{secret_file} decrypted, but has no '{password_key}'.\n"
+                f"Top-level keys present: {available}\n\n"
+                f"If this is an existing vault file whose keys are named "
+                f"differently, point at them with --password-key and "
+                f"--username-key. Dotted paths work for nested values, e.g. "
+                f"--password-key orion.api.password"
             )
 
-        resolved_user = username or secret_data.get("username")
+        resolved_user = username or cls._dig(secret_data or {}, username_key)
         if not resolved_user:
             raise OrionError(
-                f"No username: {secret_file} has no 'username' field and none "
-                f"was passed explicitly."
+                f"No username: {secret_file} has no '{username_key}', and none "
+                f"was passed with --username. Use --username-key if the field "
+                f"is named differently in this file."
             )
 
         # Cast to plain str -- Ansible's DataLoader returns AnsibleUnicode
@@ -389,7 +414,7 @@ class OrionClient:
         return cls(
             host=host,
             username=str(resolved_user),
-            password=str(secret_data["password"]),
+            password=str(resolved_password),
             port=port,
             verify_ssl=verify_ssl,
             timeout=timeout,

@@ -304,6 +304,12 @@ def main():
     conn.add_argument("--password-env", default=None)
     conn.add_argument("--use-vault-secret", action="store_true")
     conn.add_argument("--secret-path", default="orion_secret.yml")
+    conn.add_argument("--username-key", default="username",
+                      help="Which variable in the vault file holds the "
+                           "username. Dotted paths work for nested values.")
+    conn.add_argument("--password-key", default="password",
+                      help="Which variable in the vault file holds the "
+                           "password. Dotted paths work.")
     conn.add_argument("--vault-password-file", default=None)
     conn.add_argument("--port", type=int, default=DEFAULT_SWIS_PORT)
     conn.add_argument("--insecure", action="store_true")

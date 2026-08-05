@@ -441,6 +441,46 @@ ansible-vault encrypt orion_secret.yml
 
 then `--use-vault-secret`. Commit it — it is encrypted.
 
+### Using an existing vault file
+
+You do not need a purpose-made file. Point at whichever vars file
+already holds the credentials and name the variables:
+
+```bash
+python3 orion_devices.py --host <orion> --insecure --format json \
+    --use-vault-secret \
+    --secret-path group_vars/all/vault.yml \
+    --username-key orion_api_user \
+    --password-key orion_api_password
+```
+
+Dotted paths reach nested values:
+
+```bash
+--username-key orion.api.username --password-key orion.api.password
+```
+
+Both forms of vault encryption work:
+
+- **Whole-file** — `ansible-vault encrypt vars.yml`.
+- **Inline scalars** — `ansible-vault encrypt_string`, i.e. a plaintext,
+  reviewable file with only the sensitive values encrypted. This is the
+  usual shape for an existing vars file and it needed a real fix to
+  support; see `configure_vault_secrets()` in `inventory_reader.py`.
+
+Naming a key that isn't there lists the keys that *are*, so a typo in
+your own variable name is a one-shot fix rather than a guessing game.
+
+The vault password itself resolves in the usual order:
+`--vault-password-file` → `$ANSIBLE_VAULT_PASSWORD_FILE` →
+`ansible.cfg`'s `vault_password_file`.
+
+> One caveat: ansible-core's vault secrets context is **process-global
+> and first-write-wins**. Using a *different* `--vault-password-file` for
+> the inventory than for the credentials file in the same run would
+> decrypt inline scalars with whichever was configured first. One
+> password file per invocation is fine.
+
 Otherwise use `--password-env` (keeps the password out of `ps` and shell
 history) or the interactive prompt.
 
