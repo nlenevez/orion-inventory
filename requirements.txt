@@ -1,0 +1,10 @@
+requests
+
+# Only for reading an Ansible inventory (orion_inventory_sync.py) and
+# for vault-encrypted credentials. Imported inside the functions that
+# need it, so orion_devices.py and orion_probe.py run without it.
+ansible-core>=2.18.1
+
+# Used for YAML output when importable; a hand-rolled emitter takes over
+# when it isn't, since it is only probably present on the airgapped side.
+pyyaml
