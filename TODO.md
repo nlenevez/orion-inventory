@@ -10,19 +10,20 @@ mock's schema is this repo's own assumption.
 Run `orion_probe.py` on the airgapped side and bring the output back.
 Then, from `summary.txt`:
 
-- [ ] **connectivity** — confirms SWIS answers on port 17778 and the
-      account can read `Orion.Nodes`. If this fails, nothing else in
+- [x] **connectivity** — SWIS answers and the account can read
+      `Orion.Nodes`. First live attempt (2026-08-05) hit HTTP 404 on
+      port 17778; the endpoint moved to **17774** in Orion 2023.1 and
+      the instance is 2026.2.1. Default corrected. Re-confirm the rest
+      of this list against 17774. If this fails, nothing else in
       the capture means anything. Check the port first: SWIS is a
       separate listener from the Orion web UI on 443 and is often
       firewalled separately, so a working web UI does not imply a
       working API path.
-- [ ] **field IPAddress / MachineType / SysName / DNS** — the four
-      fields asked for, probed one at a time so a failure names the
-      specific property. Any FAIL here means the assumed name is wrong
-      on this Orion version; the SWIS error message names the bad
-      property, and `orion_nodes_properties.json` lists what the
-      instance really has. Correct `DEFAULT_NODE_COLUMNS` in
-      `orion_client.py`.
+- [x] **field IPAddress / MachineType / SysName / DNS** — CONFIRMED
+      2026-08-05 on 2026.2.1. The default query returns data, and SWIS
+      rejects unknown properties with a 400, so a successful SELECT of
+      all four is positive proof they exist. No correction needed to
+      `DEFAULT_NODE_COLUMNS`.
 - [ ] **status distribution** — confirms or corrects
       `NODE_STATUS_NAMES`. Any Status code appearing in the capture
       that is missing from that map renders as a bare integer. Add the

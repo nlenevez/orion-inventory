@@ -108,6 +108,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from orion_client import (  # noqa: E402
     COMMON_EXTRA_COLUMNS,
     DEFAULT_NODE_COLUMNS,
+    DEFAULT_SWIS_PORT,
+    LEGACY_SWIS_PORT,
     OrionClient,
     OrionError,
     format_status,
@@ -398,8 +400,10 @@ def main():
                            "Orion side.")
     conn.add_argument("--secret-path", default="orion_secret.yml")
     conn.add_argument("--vault-password-file", default=None)
-    conn.add_argument("--port", type=int, default=17778,
-                      help="SWIS SSL port (default: 17778)")
+    conn.add_argument("--port", type=int, default=DEFAULT_SWIS_PORT,
+                      help=f"SWIS SSL port (default: {DEFAULT_SWIS_PORT}). "
+                           f"Orion 2022.4.1 and earlier used "
+                           f"{LEGACY_SWIS_PORT}.")
     conn.add_argument("--insecure", action="store_true",
                       help="Skip TLS certificate validation. Usually needed "
                            "-- a stock Orion install has a self-signed "

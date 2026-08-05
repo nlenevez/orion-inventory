@@ -29,7 +29,7 @@ prompt instead of the vault.
 
 IMPORTANT -- confirmation status: the transport shape used here (base
 path, POST-with-parameters query form, `results` response envelope,
-HTTP Basic auth, port 17778) comes from SolarWinds' published SWIS REST
+HTTP Basic auth, port 17774) comes from SolarWinds' published SWIS REST
 documentation. It has NOT been confirmed against a live Orion instance
 -- there is no reachable Orion server on this side of the airgap.
 Treat all of it as unverified until orion/orion_probe.py has been run
@@ -45,10 +45,15 @@ them.
 
 ## The endpoint
 
-SWIS listens on **port 17778** (SSL) on the Orion server, under
+SWIS listens on **port 17774** (SSL) on the Orion server, under
 `/SolarWinds/InformationService/v3/Json/`. So a full query URL is:
 
-    https://orion.example.com:17778/SolarWinds/InformationService/v3/Json/Query
+    https://orion.example.com:17774/SolarWinds/InformationService/v3/Json/Query
+
+**The port changed in Orion 2023.1.** It was 17778 up to 2022.4.1;
+2023.1 moved REST to 17774 and deprecated 17778, and later releases stop
+listening on it. Pass `--port 17778` for anything 2022.4.1 or older. The
+path is the same on both.
 
 That certificate is **self-signed by default** on a stock Orion
 install, so verify_ssl=False (`--insecure` on the CLIs) is commonly
@@ -124,10 +129,21 @@ from pathlib import Path
 
 import requests
 
-#: SWIS's SSL listener on the Orion server. 17777 is the non-TLS
-#: internal port and 17774 was the pre-v3 endpoint -- neither is what
-#: the REST/JSON interface answers on.
-DEFAULT_SWIS_PORT = 17778
+#: SWIS's SSL listener on the Orion server.
+#:
+#: **17774, not 17778.** Orion served the REST endpoint on 17778 up to
+#: 2022.4.1; the 2023.1 release moved it to 17774 and deprecated 17778,
+#: which later releases stop listening on. Confirmed the hard way: a
+#: live 2026.2.1 instance returned HTTP 404 on 17778 -- something still
+#: answers there, so the failure looks like a bad path rather than a
+#: dead port, which is exactly what makes it slow to diagnose.
+#:
+#: Use LEGACY_SWIS_PORT with --port against anything at 2022.4.1 or
+#: older.
+DEFAULT_SWIS_PORT = 17774
+
+#: The pre-2023.1 REST port. Only for Orion 2022.4.1 and earlier.
+LEGACY_SWIS_PORT = 17778
 
 #: Path prefix for the v3 JSON endpoint, appended to scheme://host:port.
 SWIS_BASE_PATH = "/SolarWinds/InformationService/v3/Json"
@@ -236,7 +252,7 @@ class OrionClient:
                  port=DEFAULT_SWIS_PORT, verify_ssl=True, timeout=60):
         """
         host: the Orion server, e.g. "orion.example.com". A bare
-            hostname is expected; a full "https://host:17778" URL is
+            hostname is expected; a full "https://host:17774" URL is
             also accepted and parsed, so callers that already have one
             don't have to pick it apart.
         username: an Orion individual account. AD accounts take the
@@ -244,8 +260,8 @@ class OrionClient:
         password/password_env: the account password directly, or the
             name of an environment variable holding it. For vault-backed
             credentials, use from_vault_secret() instead.
-        port: SWIS SSL port, 17778 unless it's been changed on the
-            server.
+        port: SWIS SSL port. 17774 on Orion 2023.1 and later, 17778
+            on 2022.4.1 and earlier.
         verify_ssl: set False for the self-signed certificate a stock
             Orion install ships with. The scheme stays https either way
             -- Basic auth means the password is only as protected as
@@ -443,6 +459,33 @@ class OrionClient:
                 status_code=resp.status_code,
             )
 
+        if resp.status_code == 403:
+            # 403, not 401: SWIS resolved the credentials and then refused
+            # the account. The overwhelmingly common cause is an AD
+            # account whose Orion access comes from a Windows *group* --
+            # SWIS cannot authenticate those (a long-standing SID lookup
+            # problem), while the same account works fine in the web UI,
+            # which is what makes it look like a credentials mystery.
+            raise OrionError(
+                f"403 Forbidden as '{self.username}' -- the credentials were "
+                f"accepted and the account was then refused. Note SWIS "
+                f"returns 401 for a bad password, so this is authorisation, "
+                f"not authentication.\n\n"
+                f"Most likely: this is an Active Directory account whose "
+                f"Orion access comes via a Windows GROUP. SWIS cannot "
+                f"authenticate group-derived accounts even though the web UI "
+                f"can. Fix it either by adding the account to Orion as an "
+                f"INDIVIDUAL account (Settings > Manage Accounts > Add > "
+                f"Windows account), or -- better for automation -- by using "
+                f"a dedicated local Orion account, which has no AD "
+                f"dependency at all.\n\n"
+                f"Also check: the account is enabled, and if it is an AD "
+                f"account that the DOMAIN\\user form is being used. The "
+                f"definitive answer is in the SWIS log on the Orion server, "
+                f"C:\\ProgramData\\SolarWinds\\InformationService\\v3.0",
+                status_code=resp.status_code,
+            )
+
         if not resp.ok:
             # SWIS reports SWQL errors as JSON with Message/ExceptionType/
             # FullException. Fall back to raw text for anything that isn't
@@ -455,6 +498,21 @@ class OrionClient:
                     exc_type = err.get("ExceptionType")
             except ValueError:
                 pass
+            if resp.status_code == 404:
+                # A 404 here is almost always the 2023.1 port move: the
+                # old listener still answers on 17778 on some installs,
+                # so it presents as a bad path rather than a dead port.
+                # Saying so beats making the caller work it out.
+                message += (
+                    f"\n\nA 404 from SWIS usually means the wrong port. The "
+                    f"REST endpoint moved from 17778 to {DEFAULT_SWIS_PORT} in "
+                    f"Orion 2023.1, and 17778 is deprecated -- but something "
+                    f"often still answers there, which is why this shows up "
+                    f"as 404 rather than a refused connection. This request "
+                    f"used port {self.port}. Try --port "
+                    f"{LEGACY_SWIS_PORT if self.port == DEFAULT_SWIS_PORT else DEFAULT_SWIS_PORT}"
+                    f", or run orion_endpoint_probe.py to find the endpoint."
+                )
             raise OrionError(
                 f"SWQL query failed (HTTP {resp.status_code}): {message}",
                 status_code=resp.status_code,

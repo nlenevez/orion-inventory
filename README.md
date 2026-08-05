@@ -28,13 +28,27 @@ so nothing here can modify Orion even by accident. The only thing any
 script here writes is a local inventory file, and only when explicitly
 asked.
 
-## Status — not yet confirmed against a real instance
+## Status — core path confirmed against a live instance
 
-**The Orion instance is on an airgapped network and is not reachable
-from the machine this was written on.** Every property name, the SWIS
-port, the response envelope and the status-code map come from
-SolarWinds' published documentation. Nothing here has spoken to a real
-Orion server.
+**Confirmed 2026-08-05 against SolarWinds Platform 2026.2.1.** The
+device query runs end to end and returns data, which establishes:
+
+- the transport — port **17774**, the `/SolarWinds/InformationService/
+  v3/Json/Query` path, the POST-with-parameters form, HTTP Basic auth,
+  and the `results` response envelope;
+- all four property names. SWIS rejects an unknown property with a 400,
+  so a successful `SELECT` of `IPAddress`, `MachineType`, `SysName` and
+  `DNS` is positive proof they exist on this version.
+
+**Still unconfirmed**, because a single successful query does not
+exercise them: the `NODE_STATUS_NAMES` map, which custom properties
+this instance defines, and paging past the first page on a real node
+count. `orion_probe.py` covers all three in one run and is now cheap,
+since connectivity works — see `TODO.md`.
+
+The instance is on an airgapped network and is not reachable from the
+machine this was written on, so everything is still built here and
+confirmed there.
 
 What *has* been verified: the client is internally correct and speaks
 the protocol it thinks it does. `orion_mock_swis_test.py` stands up a
@@ -46,15 +60,16 @@ against a real Ansible inventory. The suite has been checked against
 deliberately broken copies of the code and fails on each, so it is not
 a vacuous pass.
 
-But a fixture written from the same assumption as the code cannot
-disagree with it. **Run `orion_probe.py` against the real instance
-before trusting any field name here.** See `TODO.md` for the checklist.
+A fixture written from the same assumption as the code cannot disagree
+with it, which is why the live confirmation above matters and the mock
+suite alone never would have.
 
 ## Files
 
 | File | Purpose |
 |---|---|
 | `orion_client.py` | Generic read-only SWIS/SWQL client |
+| `orion_endpoint_probe.py` | Finds the SWIS endpoint when the expected one 404s. Self-contained — copy it across on its own |
 | `orion_probe.py` | First-contact capture — run this first, on the airgapped side |
 | `orion_devices.py` | The device list: table / CSV / JSON / inventory skeleton |
 | `orion_inventory_sync.py` | Reconcile Orion against an Ansible inventory |
@@ -97,10 +112,146 @@ specific property instead of casting doubt on the whole set.
 self-signed certificate. The connection is still TLS; the password
 rides in an HTTP Basic header, so the scheme stays `https`.
 
-SWIS listens on **17778**, a separate listener from the Orion web UI on
-443 and often firewalled separately — a working web UI does not imply a
-working API path. That is the first thing to check if connectivity
-fails.
+SWIS listens on **17774** on Orion 2023.1 and later (it was 17778 up to
+2022.4.1 — see the 404 note below). It is a separate listener from the
+web UI on 443 and often firewalled separately, so a working web UI does
+not imply a working API path. That is the first thing to check if
+connectivity fails.
+
+## Troubleshooting: HTTP 404 — almost always the port
+
+**Orion 2023.1 moved the SWIS REST endpoint from port 17778 to 17774**,
+and deprecated 17778. Later releases stop listening on it. The catch is
+that something often still answers on 17778, so the failure arrives as
+`HTTP 404` — a bad *path* — rather than a refused connection, which is
+what makes it slow to recognise.
+
+The default here is now 17774. If you are on Orion **2022.4.1 or
+earlier**, pass `--port 17778`. The URL path is identical on both.
+
+### HTTP 403 with credentials that work in the web UI
+
+**SWIS returns 401 for a bad password.** A 403 therefore means the
+credentials were accepted and the *account* was refused — so re-checking
+the password is the one thing already ruled out.
+
+The classic cause: an **Active Directory account whose Orion access
+comes from a Windows group**. SWIS cannot authenticate group-derived
+accounts, a long-standing limitation attributed to a SID lookup problem,
+while the same account signs into the web console perfectly well — which
+is exactly what makes it look like a credentials mystery.
+
+Two fixes:
+
+1. Add the account to Orion as an **individual** account —
+   Settings → Manage Accounts → Add → Windows account.
+2. **Better for automation:** use a dedicated **local Orion account**.
+   No AD dependency, no group-SID problem, and it does not break when
+   someone reorganises group membership. This is the usual
+   recommendation for API integrations.
+
+Also worth confirming: the account is enabled, and AD accounts are being
+passed as `DOMAIN\user` (quoted on the shell).
+
+The definitive answer is in the SWIS log on the Orion server:
+`C:\ProgramData\SolarWinds\InformationService\v3.0`.
+
+### Timeout on 17774 while 17778 answers = a firewall in the path
+
+Confirmed on the live 2026.2.1 instance. The symptom set:
+
+- `--port 17774` → **ConnectTimeoutError**
+- `--port 17778` → **HTTP 404** (so the host is reachable)
+- Server shows `0.0.0.0:17774` listening, no host firewall
+
+Read it as a differential rather than three separate facts: the same
+client reaches the same host on one port and not the other, and both
+ends are excluded. The drop is therefore **between** them — a network
+firewall or ACL that was never updated when the platform moved the
+port. SolarWinds' own upgrade guidance says to update firewalls before
+upgrading, and existing rules typically permit 17778 only.
+
+**Timeout vs refused is the whole signal.** A silent drop in the path
+times out. A host that is not listening, or a host firewall set to
+reject, gives connection refused. Do not spend time on endpoint
+settings or certificates when the symptom is a timeout and another port
+on the same host answers.
+
+Confirm in two moves:
+
+```powershell
+Test-NetConnection <orion> -Port 17774    # expect False
+Test-NetConnection <orion> -Port 17778    # expect True -> port-specific
+```
+
+```bash
+# on the Orion server itself -- proves the endpoint is healthy
+curl -k -u '<account>' "https://localhost:17774/SolarWinds/InformationService/v3/Json/Query?query=SELECT+TOP+1+NodeID+FROM+Orion.Nodes"
+```
+
+The fix is a firewall rule permitting 17774 from wherever these scripts
+run. Until that lands, either run them from a host that can already
+reach the server on 17774, or use the deprecated port as a stopgap (see
+below).
+
+### If 17774 is not listening either
+
+Seen on a live 2026.2.1 instance: 17778 answers with 404, and nothing
+is listening on 17774. Both endpoints are *configurable*, so this is a
+server-side setting rather than anything the client can fix. In order
+of likelihood:
+
+1. **The REST endpoint on 17774 is disabled.** SolarWinds lets you
+   disable the SWIS REST endpoint on either port independently.
+2. **17774 cannot bind because of its certificate.** From 2023.1 that
+   port is secured by a certificate named in Centralized Settings —
+   `CertificateNameForSafeguardCommunicationOnSwisRestEndpoint`,
+   defaulting to `SolarWinds-Orion`. The certificate must be in Local
+   Machine → Personal, have an **accessible private key**, and be valid
+   for TLS server authentication. This is the one to suspect if the
+   port simply never comes up.
+3. **A host firewall rule was never added for 17774.** The upgrade
+   moves the port; it does not add the rule. Note this presents as a
+   *timeout* from a remote client, while genuinely-not-bound presents
+   as *connection refused* — worth distinguishing before chasing
+   settings.
+
+Check on the server itself, not from a client:
+
+```
+netstat -ano | findstr "17774 17778"
+```
+
+and map the PID back to a service. That is the only observation that
+separates "not listening" from "listening but unreachable".
+
+**The quickest unblock** is to re-enable the old port: in Advanced
+Configuration (`https://<orion>/Orion/Admin/AdvancedConfiguration/Global.aspx`)
+clear **`DisableSwisRestEndpointOnPort17778`**, then run any script here
+with `--port 17778`. That is a deprecated path and should be a stopgap,
+not the destination — but it gets data flowing while 17774 is sorted
+out.
+
+If changing the port does not fix it, the routing is genuinely unknown
+and guessing costs a round trip per attempt:
+
+```bash
+python3 orion_endpoint_probe.py --host <orion> --username <account> \
+    --password-env ORION_PASSWORD --insecure --output results.txt
+```
+
+It tries every plausible port/path/method combination in one run and
+reports what each actually answered — status, `Server` header, content
+type and the first bytes of the body. That identifies what is listening
+even when nothing works, which is more useful than another guess at what
+should be.
+
+Worth checking on the server at the same time:
+
+- Is the **SolarWinds Information Service V3** service running?
+- Does `netstat -an | findstr "17774 17778"` show either listening?
+- Is the host you are pointing at the one running SWIS? An Additional
+  Web Server serves the UI without necessarily serving the API.
 
 ## 2. List the devices
 

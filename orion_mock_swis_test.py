@@ -120,6 +120,15 @@ class MockSwisHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"Message": f"No route {self.path}"})
             return
 
+        # Lets a test reproduce a status the mock has no natural way to
+        # produce -- a 403 depends on Orion account configuration, not on
+        # anything in the request. Checked before auth so a forced status
+        # is not masked by the credential check.
+        forced = getattr(self.server, "force_status", None)
+        if forced:
+            self._send_json(forced, {"Message": f"forced status {forced}"})
+            return
+
         auth = self.headers.get("Authorization", "")
         if not auth.startswith("Basic "):
             self._send_json(401, {"Message": "No Basic credentials"})
@@ -263,6 +272,7 @@ class MockSwisServer:
         self.httpd = HTTPServer(("127.0.0.1", 0), MockSwisHandler)
         self.httpd.request_log = []
         self.httpd.query_log = []
+        self.httpd.force_status = None
 
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(certfile=str(cert), keyfile=str(key))
@@ -276,6 +286,14 @@ class MockSwisServer:
     @property
     def query_log(self):
         return self.httpd.query_log
+
+    @property
+    def force_status(self):
+        return self.httpd.force_status
+
+    @force_status.setter
+    def force_status(self, value):
+        self.httpd.force_status = value
 
     def stop(self):
         self.httpd.shutdown()
@@ -337,6 +355,91 @@ class OrionClientTests(unittest.TestCase):
                          "SolarWinds.Data.SwisException")
         self.assertIn("NoSuchColumn", str(ctx.exception))
 
+    def test_403_explains_the_ad_group_cause(self):
+        """A live instance returned 403 with valid credentials. SWIS
+        returns 401 for a bad password, so a 403 is authorisation --
+        classically an AD account whose Orion access comes via a Windows
+        group, which SWIS cannot authenticate even though the web UI
+        can. The message has to say that; "403 Forbidden" alone sends
+        the reader back to re-checking the password, which is the one
+        thing already excluded."""
+        self.server.force_status = 403
+        try:
+            with self.assertRaises(OrionError) as ctx:
+                self.client.query("SELECT NodeID FROM Orion.Nodes")
+        finally:
+            self.server.force_status = None
+
+        message = str(ctx.exception)
+        self.assertEqual(ctx.exception.status_code, 403)
+        self.assertIn("401 for a bad password", message)
+        self.assertIn("GROUP", message)
+        self.assertIn("INDIVIDUAL account", message)
+        self.assertIn("InformationService", message)
+
+    def test_401_and_403_are_distinguished(self):
+        """Negative control: the two must not collapse into one message.
+        A 401 is a password problem and a 403 is not, and telling the
+        reader to go and reconfigure an AD account when the password is
+        simply wrong would be worse than saying nothing."""
+        bad = OrionClient(host="127.0.0.1", username=USERNAME,
+                          password="wrong", port=self.server.port,
+                          verify_ssl=False, timeout=15)
+        with self.assertRaises(OrionError) as ctx:
+            bad.query("SELECT NodeID FROM Orion.Nodes")
+        self.assertEqual(ctx.exception.status_code, 401)
+        self.assertNotIn("GROUP", str(ctx.exception))
+
+    def test_404_names_the_port_change(self):
+        """A live 2026.2.1 instance returned 404 on port 17778, because
+        the REST endpoint moved to 17774 in Orion 2023.1 and something
+        else still answers on the old port -- so it presents as a bad
+        path, not a dead port. That cost a round trip across the airgap.
+        The message must now say so.
+
+        The 404 is produced by pointing the client at a path the mock
+        does not route, which is the same thing an out-of-date port does
+        in practice: an HTTP server that answers but does not know this
+        URL.
+        """
+        import orion_client
+        original = orion_client.SWIS_BASE_PATH
+        try:
+            orion_client.SWIS_BASE_PATH = "/NotTheSwisPath/v3/Json"
+            client = OrionClient(host="127.0.0.1", username=USERNAME,
+                                 password=PASSWORD, port=self.server.port,
+                                 verify_ssl=False, timeout=15)
+            with self.assertRaises(OrionError) as ctx:
+                client.query("SELECT NodeID FROM Orion.Nodes")
+        finally:
+            orion_client.SWIS_BASE_PATH = original
+
+        message = str(ctx.exception)
+        self.assertEqual(ctx.exception.status_code, 404)
+        self.assertIn("wrong port", message)
+        self.assertIn("17778", message)
+        self.assertIn("2023.1", message)
+        self.assertIn("orion_endpoint_probe.py", message)
+
+    def test_non_404_errors_do_not_mention_the_port(self):
+        """Negative control for the hint above: it must be attached to
+        404s specifically, not pasted onto every failure. A 400 from a
+        bad property is not a port problem, and saying so would send the
+        next person down the wrong path."""
+        with self.assertRaises(OrionError) as ctx:
+            self.client.query("SELECT NoSuchColumn FROM Orion.Nodes")
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertNotIn("wrong port", str(ctx.exception))
+
+    def test_default_port_is_the_current_one(self):
+        """Orion 2023.1 moved REST from 17778 to 17774."""
+        from orion_client import DEFAULT_SWIS_PORT, LEGACY_SWIS_PORT
+        self.assertEqual(DEFAULT_SWIS_PORT, 17774)
+        self.assertEqual(LEGACY_SWIS_PORT, 17778)
+        client = OrionClient(host="orion.example.com", username="u",
+                             password="p")
+        self.assertIn(":17774/", client.base_url)
+
     def test_connection_refused_is_reported_clearly(self):
         dead = OrionClient(host="127.0.0.1", username=USERNAME,
                            password=PASSWORD, port=1, verify_ssl=False,
@@ -360,13 +463,13 @@ class OrionClientTests(unittest.TestCase):
 
     def test_host_normalisation(self):
         for given in ("orion.example.com", "https://orion.example.com",
-                      "https://orion.example.com:17778",
+                      "https://orion.example.com:17774",
                       "https://orion.example.com/Orion/Login.aspx"):
             client = OrionClient(host=given, username="u", password="p")
             self.assertEqual(client.host, "orion.example.com", given)
             self.assertEqual(
                 client.base_url,
-                "https://orion.example.com:17778"
+                "https://orion.example.com:17774"
                 "/SolarWinds/InformationService/v3/Json",
             )
 

@@ -86,7 +86,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from orion_client import DEFAULT_NODE_COLUMNS, OrionClient, OrionError  # noqa: E402
+from orion_client import (  # noqa: E402
+    DEFAULT_NODE_COLUMNS,
+    DEFAULT_SWIS_PORT,
+    OrionClient,
+    OrionError,
+)
 from orion_devices import (  # noqa: E402
     _inventory_hostname,
     build_client,
@@ -300,7 +305,7 @@ def main():
     conn.add_argument("--use-vault-secret", action="store_true")
     conn.add_argument("--secret-path", default="orion_secret.yml")
     conn.add_argument("--vault-password-file", default=None)
-    conn.add_argument("--port", type=int, default=17778)
+    conn.add_argument("--port", type=int, default=DEFAULT_SWIS_PORT)
     conn.add_argument("--insecure", action="store_true")
     conn.add_argument("--timeout", type=int, default=60)
 

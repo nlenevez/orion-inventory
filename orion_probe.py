@@ -57,6 +57,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from orion_client import (  # noqa: E402
     DEFAULT_NODE_COLUMNS,
+    DEFAULT_SWIS_PORT,
+    LEGACY_SWIS_PORT,
     OrionClient,
     OrionError,
 )
@@ -124,7 +126,7 @@ def build_probes(sample_rows):
     probes = [
         Probe(
             "connectivity",
-            "SWIS answers on port 17778 and the account can read "
+            f"SWIS answers on the port given and the account can read "
             "Orion.Nodes. If this fails, nothing below is meaningful.",
             "SELECT TOP 1 NodeID FROM Orion.Nodes",
         ),
@@ -284,7 +286,10 @@ def main():
     parser.add_argument("--password-env", default=None,
                         help="Environment variable holding the password. "
                              "Without it you are prompted, not echoed.")
-    parser.add_argument("--port", type=int, default=17778)
+    parser.add_argument("--port", type=int, default=DEFAULT_SWIS_PORT,
+                        help=f"SWIS SSL port (default: {DEFAULT_SWIS_PORT}). "
+                             f"Orion 2022.4.1 and earlier used "
+                             f"{LEGACY_SWIS_PORT}.")
     parser.add_argument("--insecure", action="store_true",
                         help="Skip TLS certificate validation -- usually "
                              "needed against a stock Orion's self-signed "
